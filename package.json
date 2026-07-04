@@ -1,0 +1,40 @@
+{
+  "name": "@fortmesa/verdaccio-offline-enforcer",
+  "version": "1.0.0",
+  "description": "Verdaccio middleware plugin: forces configured usernames (and optionally unauthenticated requests) into offline mode, serving only already-cached packages instead of proxying to upstream",
+  "license": "MIT",
+  "repository": "fortmesa/verdaccio-offline-enforcer",
+  "homepage": "https://github.com/fortmesa/verdaccio-offline-enforcer#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "verdaccio",
+    "verdaccio-plugin",
+    "npm-registry",
+    "offline",
+    "caching"
+  ],
+  "main": "index.js",
+  "packageManager": "yarn@4.17.0",
+  "files": [
+    "index.js"
+  ],
+  "scripts": {
+    "prepare": "husky",
+    "test": "node test/smoke.js"
+  },
+  "lint-staged": {
+    "**/*.{js,yml,yaml,json,md}": [
+      "prettier --write"
+    ]
+  },
+  "dependencies": {
+    "@verdaccio/tarball": "^13.0.3"
+  },
+  "devDependencies": {
+    "husky": "^9.1.7",
+    "lint-staged": "^17.0.8",
+    "prettier": "^3.3.3"
+  }
+}
