@@ -1,11 +1,12 @@
 # `verdaccio-offline-enforcer`
 
 A [Verdaccio](https://verdaccio.org) middleware plugin: forces specific
-usernames (or unauthenticated requests) into cache-only mode, serving only
-already-cached packages instead of proxying to an upstream registry.
+usernames or groups (or unauthenticated requests) into cache-only mode, serving
+only already-cached packages instead of proxying to an upstream registry.
 
-**Type**: Verdaccio `middlewares` (Express) plugin. **Config key**:
-`middlewares.offline-enforcer`.
+**Type**: Verdaccio `middlewares` (Express) plugin. **Config key** (the literal,
+scoped package name -- Verdaccio never prefix-mangles a scoped plugin's config
+key): `middlewares."@fortmesa/verdaccio-offline-enforcer"`.
 
 ## What it does
 
@@ -13,16 +14,25 @@ Forces specific requests into "cache-only" mode: instead of proxying to an
 upstream uplink for anything not already stored locally, the request gets a
 `404` if it's not already cached. This is a _scoped_ version of Verdaccio's own
 global `uplinks.<name>.offline: true` freeze -- that setting affects every
-client; this plugin lets you restrict just certain usernames, or just
+client; this plugin lets you restrict just certain identities, or just
 anonymous/unauthenticated traffic, without freezing the whole registry.
+
+`online`/`offline` accept a username **or** a group name, exactly like
+Verdaccio's own `packages: access/publish` and every other plugin in this stack
+(generic-oidc's `roles.allowList`, oidc-auth's `groupTemplates`) treat the two
+as the same kind of thing -- a plain string checked against whichever apply to
+the current user. A user matches an entry if their own username matches it, or
+if any of their groups do (Verdaccio's `real_groups` -- the groups a plugin
+actually assigned, not the `$all`/`$authenticated`-style defaults every
+logged-in user also carries).
 
 Restriction is decided per request, in this order:
 
 1. Unauthenticated (`remote_user.name` is undefined): governed by
    `enforceForAnonymous` alone, regardless of the online/offline lists below.
-2. `req.remote_user.name` is in `onlineUsernames`: never restricted.
-3. `req.remote_user.name` is in `offlineUsernames`: always restricted.
-4. Otherwise (an authenticated user in neither list): governed by
+2. The user's name or any of their groups is in `online`: never restricted.
+3. The user's name or any of their groups is in `offline`: always restricted.
+4. Otherwise (an authenticated user matching neither): governed by
    `enforceForUnknown`.
 
 ## Installation
@@ -35,18 +45,17 @@ npm install @fortmesa/verdaccio-offline-enforcer
 
 ```yaml
 middlewares:
-  offline-enforcer:
-    onlineUsernames: [] # usernames always allowed to proxy, regardless of everything else
-    offlineUsernames: [] # usernames restricted to cache-only (default: none)
+  '@fortmesa/verdaccio-offline-enforcer':
+    online: [] # usernames/groups always allowed to proxy, regardless of everything else
+    offline: [] # usernames/groups restricted to cache-only (default: none)
     enforceForAnonymous: true # anonymous requests are cache-only by default
     enforceForUnknown:
       false # default false preserves today's behavior -- an authenticated
-      # user in neither list is allowed; set true to flip that default
+      # user matching neither list is allowed; set true to flip that default
 ```
 
-Construction throws if the same username appears in both `onlineUsernames` and
-`offlineUsernames` -- a config mistake, not something to silently resolve one
-way or the other.
+Construction throws if the same entry appears in both `online` and `offline` --
+a config mistake, not something to silently resolve one way or the other.
 
 ## Behavior details
 

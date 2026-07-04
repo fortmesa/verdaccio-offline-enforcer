@@ -23,8 +23,29 @@ class OfflineEnforcer {
   constructor(config, options) {
     this.logger = options.logger;
     this.urlPrefix = config.urlPrefix;
-    this.onlineUsernames = new Set(config.onlineUsernames ?? []);
-    this.offlineUsernames = new Set(config.offlineUsernames ?? []);
+
+    // Renamed from onlineUsernames/offlineUsernames -- those old keys are no
+    // longer read at all, so a config still using them would otherwise go
+    // quietly inert (enforceForAnonymous/enforceForUnknown would be the only
+    // thing left deciding restriction, silently dropping every configured
+    // exemption). Fail loud instead of leaving a stale config no-op.
+    if ('onlineUsernames' in config || 'offlineUsernames' in config) {
+      throw new Error(
+        "offline-enforcer: 'onlineUsernames'/'offlineUsernames' were renamed to 'online'/'offline' " +
+          '(now accepting usernames or groups, not just usernames) -- update your config',
+      );
+    }
+
+    // A single list per state -- deliberately not split into separate
+    // username/group config keys. Every other plugin in this stack
+    // (generic-oidc's roles.allowList, oidc-auth's groupTemplates,
+    // Verdaccio's own packages: access/publish) treats a username and a
+    // group name as the same kind of thing: a plain string checked against
+    // whichever ones apply to the current user. This plugin now matches
+    // that convention instead of being the one place a username and a
+    // group are configured differently.
+    this.online = new Set(config.online ?? []);
+    this.offline = new Set(config.offline ?? []);
     this.enforceForAnonymous = config.enforceForAnonymous ?? true;
     // Default false preserves today's behavior (any authenticated user not
     // explicitly offline-listed is implicitly allowed); set true to flip
@@ -33,23 +54,30 @@ class OfflineEnforcer {
 
     // Fail loud at startup on a config mistake, not silently-one-wins at
     // request time -- this is an access control.
-    for (const name of this.onlineUsernames) {
-      if (this.offlineUsernames.has(name)) {
+    for (const entry of this.online) {
+      if (this.offline.has(entry)) {
         throw new Error(
-          `offline-enforcer: username '${name}' is listed in both onlineUsernames and offlineUsernames`,
+          `offline-enforcer: '${entry}' is listed in both online and offline`,
         );
       }
     }
   }
 
   // Anonymous users have no `name`, handled first via enforceForAnonymous.
-  // Otherwise: onlineUsernames always wins (never restricted), then
-  // offlineUsernames (always restricted), then enforceForUnknown decides
-  // anyone in neither list.
+  // Otherwise, checks the user's own name AND every group Verdaccio's
+  // createRemoteUser() actually put them in (real_groups -- the plugin-
+  // provided groups, not the .groups superset that also carries the
+  // universal $all/$authenticated-style defaults every logged-in user gets,
+  // which would make onlineness/offlineness meaningless if matched against
+  // those too) against online/offline: online always wins (never
+  // restricted) if the name or ANY group matches, then offline (always
+  // restricted) the same way, then enforceForUnknown decides anyone
+  // matching neither.
   _isRestricted(remoteUser) {
     if (remoteUser?.name === undefined) return this.enforceForAnonymous;
-    if (this.onlineUsernames.has(remoteUser.name)) return false;
-    if (this.offlineUsernames.has(remoteUser.name)) return true;
+    const identities = [remoteUser.name, ...(remoteUser.real_groups ?? [])];
+    if (identities.some(id => this.online.has(id))) return false;
+    if (identities.some(id => this.offline.has(id))) return true;
     return this.enforceForUnknown;
   }
 

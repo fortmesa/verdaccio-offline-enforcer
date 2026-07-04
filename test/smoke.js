@@ -93,21 +93,85 @@ async function main() {
   await check(
     'online user is never restricted, even when also anonymous-restricted by default',
     () => {
-      const enforcer = factory(
-        {onlineUsernames: ['alice']},
-        {logger: NOOP_LOGGER},
-      );
+      const enforcer = factory({online: ['alice']}, {logger: NOOP_LOGGER});
       assert.equal(enforcer._isRestricted({name: 'alice'}), false);
     },
   );
 
   await check('offline user is always restricted', () => {
-    const enforcer = factory(
-      {offlineUsernames: ['bob']},
-      {logger: NOOP_LOGGER},
-    );
+    const enforcer = factory({offline: ['bob']}, {logger: NOOP_LOGGER});
     assert.equal(enforcer._isRestricted({name: 'bob'}), true);
   });
+
+  await check(
+    'a group in online (via real_groups) is never restricted, even for a username not itself listed',
+    () => {
+      const enforcer = factory(
+        {online: ['fortmesa.com']},
+        {logger: NOOP_LOGGER},
+      );
+      assert.equal(
+        enforcer._isRestricted({
+          name: 'alice@fortmesa.com',
+          real_groups: ['fortmesa.com'],
+        }),
+        false,
+      );
+    },
+  );
+
+  await check(
+    'a group in offline (via real_groups) is always restricted, even for a username not itself listed',
+    () => {
+      const enforcer = factory(
+        {offline: ['gha-org:untrusted-org']},
+        {logger: NOOP_LOGGER},
+      );
+      assert.equal(
+        enforcer._isRestricted({
+          name: 'gha:untrusted-org/some-repo',
+          real_groups: ['gha:untrusted-org/some-repo', 'gha-org:untrusted-org'],
+        }),
+        true,
+      );
+    },
+  );
+
+  await check(
+    'matching is against real_groups, not the .groups superset every logged-in user gets ($all/$authenticated) -- those must never accidentally satisfy online',
+    () => {
+      // enforceForUnknown: true makes this test actually meaningful -- if
+      // '$authenticated' wrongly matched via .groups instead of
+      // real_groups, this would come back false (exempted as online)
+      // instead of falling through to enforceForUnknown's true.
+      const enforcer = factory(
+        {online: ['$authenticated'], enforceForUnknown: true},
+        {logger: NOOP_LOGGER},
+      );
+      assert.equal(
+        enforcer._isRestricted({
+          name: 'alice',
+          groups: ['team1', '$all', '$authenticated'],
+          real_groups: ['team1'],
+        }),
+        true,
+      );
+    },
+  );
+
+  await check(
+    'construction throws loud if the old onlineUsernames/offlineUsernames keys are still present',
+    () => {
+      assert.throws(
+        () => factory({onlineUsernames: ['alice']}, {logger: NOOP_LOGGER}),
+        /renamed to 'online'\/'offline'/,
+      );
+      assert.throws(
+        () => factory({offlineUsernames: ['bob']}, {logger: NOOP_LOGGER}),
+        /renamed to 'online'\/'offline'/,
+      );
+    },
+  );
 
   await check(
     "a user in neither list follows enforceForUnknown (default false preserves today's behavior)",
@@ -132,14 +196,11 @@ async function main() {
   );
 
   await check(
-    'construction throws if a username is listed as both online and offline',
+    'construction throws if the same entry is listed as both online and offline',
     () => {
       assert.throws(
         () =>
-          factory(
-            {onlineUsernames: ['dave'], offlineUsernames: ['dave']},
-            {logger: NOOP_LOGGER},
-          ),
+          factory({online: ['dave'], offline: ['dave']}, {logger: NOOP_LOGGER}),
         /listed in both/,
       );
     },
@@ -151,7 +212,7 @@ async function main() {
     "an online user reaches Verdaccio's own handling untouched, even under enforceForUnknown: true",
     async () => {
       const enforcer = factory(
-        {onlineUsernames: ['alice'], enforceForUnknown: true},
+        {online: ['alice'], enforceForUnknown: true},
         {logger: NOOP_LOGGER},
       );
       const storage = makeFakeStorage();
