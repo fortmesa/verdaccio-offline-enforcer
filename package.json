@@ -1,6 +1,6 @@
 {
   "name": "@fortmesa/verdaccio-offline-enforcer",
-  "version": "2.0.2",
+  "version": "2.0.3",
   "description": "Verdaccio middleware plugin: forces configured usernames/groups (and optionally unauthenticated requests) into offline mode, serving only already-cached packages instead of proxying to upstream",
   "license": "MIT",
   "repository": "fortmesa/verdaccio-offline-enforcer",
