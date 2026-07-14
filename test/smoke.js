@@ -249,6 +249,70 @@ async function main() {
     },
   );
 
+  await check(
+    'a scoped package is enforced, not bypassed -- a restricted user is blocked from a not-locally-cached scoped tarball',
+    async () => {
+      const enforcer = factory({offline: ['bob']}, {logger: NOOP_LOGGER});
+      const storage = makeFakeStorage({hasLocalTarball: false});
+      const handler = captureHandler(enforcer, storage);
+      // Real npm client shape: a literal "/" between scope and package name,
+      // not pre-encoded -- normalizeScopedPath() is what turns this into a
+      // single logical segment.
+      const req = makeReq({
+        path: '/@scope/pkg/-/pkg-1.0.0.tgz',
+        remoteUser: {name: 'bob'},
+      });
+      const res = makeRes();
+      await new Promise(resolve => {
+        handler(req, res, () => {});
+        setImmediate(resolve);
+      });
+      assert.equal(
+        res.statusCode,
+        404,
+        'a scoped package must be enforced (checked against local storage), never handed off to next() untouched',
+      );
+    },
+  );
+
+  await check(
+    'a scoped package with a pre-encoded scope (%40) is also enforced',
+    async () => {
+      const enforcer = factory({offline: ['bob']}, {logger: NOOP_LOGGER});
+      const storage = makeFakeStorage({hasLocalTarball: false});
+      const handler = captureHandler(enforcer, storage);
+      const req = makeReq({
+        path: '/%40scope%2Fpkg/-/pkg-1.0.0.tgz',
+        remoteUser: {name: 'bob'},
+      });
+      const res = makeRes();
+      await new Promise(resolve => {
+        handler(req, res, () => {});
+        setImmediate(resolve);
+      });
+      assert.equal(res.statusCode, 404);
+    },
+  );
+
+  await check(
+    'an online user still reaches a scoped package untouched',
+    async () => {
+      const enforcer = factory({online: ['alice']}, {logger: NOOP_LOGGER});
+      const storage = makeFakeStorage();
+      const handler = captureHandler(enforcer, storage);
+      const req = makeReq({
+        path: '/@scope/pkg/-/pkg-1.0.0.tgz',
+        remoteUser: {name: 'alice'},
+      });
+      const res = makeRes();
+      let nextCalled = false;
+      handler(req, res, () => {
+        nextCalled = true;
+      });
+      assert.equal(nextCalled, true);
+    },
+  );
+
   console.log(`\n${passed} check(s) passed.`);
 }
 

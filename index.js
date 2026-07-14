@@ -19,6 +19,24 @@ function isSafeName(segment) {
   );
 }
 
+// A decoded package name: either a single safe segment (unscoped, e.g.
+// "left-pad"), or exactly one "/" with a "@scope" half on the left (itself
+// a safe segment once its leading "@" is stripped) and a safe segment on
+// the right (e.g. "@scope/pkg"). Anything with zero "/" but a leading "@",
+// or more than one "/", is never a real package name and must not be
+// treated as a safe one just because it superficially looks segment-like.
+function isSafePackageName(name) {
+  if (typeof name !== 'string' || name.includes('..')) return false;
+  const parts = name.split('/');
+  if (parts.length === 1) return SAFE_SEGMENT.test(name);
+  return (
+    parts.length === 2 &&
+    parts[0].startsWith('@') &&
+    SAFE_SEGMENT.test(parts[0].slice(1)) &&
+    SAFE_SEGMENT.test(parts[1])
+  );
+}
+
 class OfflineEnforcer {
   constructor(config, options) {
     this.logger = options.logger;
@@ -91,7 +109,7 @@ class OfflineEnforcer {
       if (segments.length === 0 || segments[0] === '-') return next();
 
       const rawPackageName = decodeURIComponent(segments[0]);
-      if (!isSafeName(rawPackageName)) return next();
+      if (!isSafePackageName(rawPackageName)) return next();
 
       if (segments[1] === '-') {
         if (segments.length < 3 || !isSafeName(segments[2])) return next();
