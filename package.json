@@ -1,9 +1,12 @@
 {
   "name": "@fortmesa/verdaccio-offline-enforcer",
-  "version": "2.0.4",
+  "version": "2.1.0",
   "description": "Verdaccio middleware plugin: forces configured usernames/groups (and optionally unauthenticated requests) into offline mode, serving only already-cached packages instead of proxying to upstream",
   "license": "MIT",
-  "repository": "fortmesa/verdaccio-offline-enforcer",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fortmesa/verdaccio-offline-enforcer.git"
+  },
   "homepage": "https://github.com/fortmesa/verdaccio-offline-enforcer#readme",
   "publishConfig": {
     "access": "public"
@@ -16,25 +19,26 @@
     "caching"
   ],
   "main": "index.js",
-  "packageManager": "yarn@4.17.0",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "packageManager": "yarn@4.18.1+sha512.b2e1e7524f654f2749d32b4ebcb4622473cb5bcbc485df2007e12a154e50162a4d795526768bc5f5b8f81717bfd79deb2472813d86fb5ae2eb551fa9c872b08f",
   "files": [
     "index.js"
   ],
   "scripts": {
     "prepare": "husky",
-    "test": "node test/smoke.js"
+    "test": "node test/smoke.js && node test/verdaccio.js"
   },
   "lint-staged": {
     "**/*.{js,yml,yaml,json,md}": [
       "prettier --write"
     ]
   },
-  "dependencies": {
-    "@verdaccio/tarball": "^13.0.3"
-  },
   "devDependencies": {
     "husky": "^9.1.7",
-    "lint-staged": "^17.0.8",
-    "prettier": "^3.3.3"
+    "lint-staged": "^17.6.0",
+    "prettier": "^3.9.10",
+    "verdaccio": "^6.10.7"
   }
 }

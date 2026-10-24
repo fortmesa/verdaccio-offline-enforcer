@@ -1,11 +1,10 @@
 'use strict';
 
-// Manual smoke test -- this repo has no test framework/build step for its
-// plugins. Run with:
-//   node verdaccio-offline-enforcer/test/smoke.js
-// Captures register_middlewares()'s single handler (same pattern as
-// verdaccio-oidc-auth/test/smoke.js's captureHandler) and drives it against
-// hand-built req/res objects and a minimal fake Storage.
+// Unit checks, no Verdaccio process: the restriction rules, and the storage
+// wrappers register_middlewares() installs, against a fake storage that
+// records what Verdaccio's own code would have received. test/verdaccio.js
+// runs the plugin inside a real Verdaccio. Run with:
+//   node test/smoke.js
 
 const assert = require('node:assert/strict');
 const {PassThrough} = require('node:stream');
@@ -13,64 +12,89 @@ const factory = require('../index.js');
 
 const NOOP_LOGGER = {warn() {}, error() {}, info() {}};
 
-function captureHandler(enforcer, storage) {
-  let handler;
-  enforcer.register_middlewares({use: fn => (handler = fn)}, null, storage);
-  return handler;
-}
-
-function makeFakeStorage({hasLocalTarball = true} = {}) {
-  return {
-    hasLocalTarball: async () => hasLocalTarball,
-    getTarball() {
+// Stands in for Verdaccio's Storage: each method records its arguments, and
+// local storage holds whatever `stored` lists.
+function makeFakeStorage({stored = {}, allowed = true} = {}) {
+  const calls = [];
+  const storage = {
+    calls,
+    _syncUplinksMetadata(name, info, options, callback) {
+      calls.push({method: '_syncUplinksMetadata', name, options});
+      process.nextTick(() =>
+        name in stored
+          ? callback(null, stored[name])
+          : callback(Object.assign(new Error('not found'), {status: 404})),
+      );
+    },
+    async _isTarballAllowedByFilters(name, filename) {
+      calls.push({method: '_isTarballAllowedByFilters', name, filename});
+      return allowed;
+    },
+    getTarball(name, filename) {
+      calls.push({method: 'getTarball (Verdaccio)', name, filename});
       const stream = new PassThrough();
-      process.nextTick(() => stream.end('tarball-bytes'));
+      process.nextTick(() => stream.end('from-verdaccio'));
       return stream;
     },
-    getPackage({callback}) {
-      callback(null, {
-        name: 'some-pkg',
-        versions: {'1.0.0': {}},
-        'dist-tags': {latest: '1.0.0'},
-        time: {},
+    search(startkey, options) {
+      calls.push({method: 'search', startkey, options});
+      return new PassThrough({objectMode: true});
+    },
+    localStorage: {
+      getTarball(name, filename) {
+        calls.push({method: 'localStorage.getTarball', name, filename});
+        const stream = new PassThrough();
+        process.nextTick(() => {
+          const key = `${name}/${filename}`;
+          if (key in stored) {
+            stream.emit('content-length', stored[key].length);
+            stream.emit('open');
+            stream.end(stored[key]);
+          } else {
+            stream.emit(
+              'error',
+              Object.assign(new Error('no such file available'), {
+                status: 404,
+              }),
+            );
+          }
+        });
+        return stream;
+      },
+    },
+  };
+  return storage;
+}
+
+// Installs the plugin on a fake app and returns a function that runs `fn`
+// inside the plugin's middleware for a request with this method and user,
+// the way Verdaccio's own route handler would run after it.
+function install(enforcer, storage) {
+  let middleware;
+  enforcer.register_middlewares({use: fn => (middleware = fn)}, {}, storage);
+  return (method, remoteUser, fn) =>
+    new Promise((resolve, reject) => {
+      middleware({method, remote_user: remoteUser}, {}, () => {
+        Promise.resolve().then(fn).then(resolve, reject);
       });
-    },
-  };
+    });
 }
 
-function makeReq({method = 'GET', path = '/some-pkg', remoteUser} = {}) {
-  return {
-    method,
-    path,
-    headers: {},
-    protocol: 'http',
-    hostname: 'localhost',
-    socket: {remoteAddress: '127.0.0.1'},
-    remote_user: remoteUser,
-  };
+function readAll(stream) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    stream.on('data', c => chunks.push(Buffer.from(c)));
+    stream.on('end', () => resolve(Buffer.concat(chunks).toString()));
+    stream.on('error', reject);
+  });
 }
 
-function makeRes() {
-  return {
-    statusCode: 200,
-    headers: {},
-    status(code) {
-      this.statusCode = code;
-      return this;
-    },
-    json(body) {
-      this.body = body;
-      return this;
-    },
-    header(name, value) {
-      this.headers[name] = value;
-      return this;
-    },
-    setHeader(name, value) {
-      this.headers[name] = value;
-      return this;
-    },
-  };
+function syncUplinks(storage, name) {
+  return new Promise(resolve =>
+    storage._syncUplinksMetadata(name, null, {}, (err, data) =>
+      resolve({err, data}),
+    ),
+  );
 }
 
 async function main() {
@@ -206,110 +230,181 @@ async function main() {
     },
   );
 
-  // --- End-to-end request-handling checks ---
+  // --- storage wrappers ---
+
+  const RESTRICTED = {name: 'ci-bot', real_groups: []};
+  const ONLINE = {name: 'alice', real_groups: ['fortmesa.com']};
+  const ANONYMOUS = {name: undefined, groups: [], real_groups: []};
+  const config = {online: ['fortmesa.com'], enforceForUnknown: true};
 
   await check(
-    "an online user reaches Verdaccio's own handling untouched, even under enforceForUnknown: true",
+    "a restricted identity's GET and HEAD look nothing up on an uplink",
     async () => {
-      const enforcer = factory(
-        {online: ['alice'], enforceForUnknown: true},
-        {logger: NOOP_LOGGER},
-      );
       const storage = makeFakeStorage();
-      const handler = captureHandler(enforcer, storage);
-      const req = makeReq({remoteUser: {name: 'alice'}});
-      const res = makeRes();
-      let nextCalled = false;
-      handler(req, res, () => {
-        nextCalled = true;
-      });
-      assert.equal(nextCalled, true);
-    },
-  );
-
-  await check(
-    'an unknown user is blocked from a not-locally-cached tarball when enforceForUnknown is true',
-    async () => {
-      const enforcer = factory(
-        {enforceForUnknown: true},
-        {logger: NOOP_LOGGER},
+      const run = install(factory(config, {logger: NOOP_LOGGER}), storage);
+      for (const method of ['GET', 'HEAD']) {
+        await run(method, RESTRICTED, () => syncUplinks(storage, 'left-pad'));
+      }
+      const syncs = storage.calls.filter(
+        c => c.method === '_syncUplinksMetadata',
       );
-      const storage = makeFakeStorage({hasLocalTarball: false});
-      const handler = captureHandler(enforcer, storage);
-      const req = makeReq({
-        path: '/some-pkg/-/some-pkg-1.0.0.tgz',
-        remoteUser: {name: 'carol'},
-      });
-      const res = makeRes();
-      await new Promise(resolve => {
-        handler(req, res, () => {});
-        setImmediate(resolve); // _handleTarball resolves storage.hasLocalTarball() asynchronously
-      });
-      assert.equal(res.statusCode, 404);
+      assert.equal(syncs.length, 2);
+      assert.ok(syncs.every(c => c.options.uplinksLook === false));
+    },
+  );
+
+  await check('anonymous reads are restricted by default too', async () => {
+    const storage = makeFakeStorage();
+    const run = install(factory(config, {logger: NOOP_LOGGER}), storage);
+    await run('GET', ANONYMOUS, () => syncUplinks(storage, 'left-pad'));
+    assert.equal(storage.calls[0].options.uplinksLook, false);
+  });
+
+  await check(
+    "an online identity's reads, and anyone's writes, keep Verdaccio's uplink lookups",
+    async () => {
+      const storage = makeFakeStorage();
+      const run = install(factory(config, {logger: NOOP_LOGGER}), storage);
+      await run('GET', ONLINE, () => syncUplinks(storage, 'left-pad'));
+      // A publish checks the uplink for an existing name; that must still
+      // happen for a restricted publisher.
+      await run('PUT', RESTRICTED, () => syncUplinks(storage, 'new-pkg'));
+      assert.deepEqual(
+        storage.calls.map(c => c.options.uplinksLook),
+        [undefined, undefined],
+      );
     },
   );
 
   await check(
-    'a scoped package is enforced, not bypassed -- a restricted user is blocked from a not-locally-cached scoped tarball',
+    'a call with no request context (nothing set by the middleware) is left alone',
     async () => {
-      const enforcer = factory({offline: ['bob']}, {logger: NOOP_LOGGER});
-      const storage = makeFakeStorage({hasLocalTarball: false});
-      const handler = captureHandler(enforcer, storage);
-      // Real npm client shape: a literal "/" between scope and package name,
-      // not pre-encoded -- normalizeScopedPath() is what turns this into a
-      // single logical segment.
-      const req = makeReq({
-        path: '/@scope/pkg/-/pkg-1.0.0.tgz',
-        remoteUser: {name: 'bob'},
+      const storage = makeFakeStorage();
+      install(factory(config, {logger: NOOP_LOGGER}), storage);
+      await syncUplinks(storage, 'left-pad');
+      assert.equal(storage.calls[0].options.uplinksLook, undefined);
+    },
+  );
+
+  await check(
+    "a restricted tarball read is served from local storage after the filter check, never through Verdaccio's getTarball",
+    async () => {
+      const storage = makeFakeStorage({
+        stored: {'left-pad/left-pad-1.3.0.tgz': 'cached-bytes'},
       });
-      const res = makeRes();
-      await new Promise(resolve => {
-        handler(req, res, () => {});
-        setImmediate(resolve);
+      const run = install(factory(config, {logger: NOOP_LOGGER}), storage);
+      let length;
+      const body = await run('GET', RESTRICTED, () => {
+        const stream = storage.getTarball('left-pad', 'left-pad-1.3.0.tgz');
+        stream.on('content-length', v => (length = v));
+        return readAll(stream);
       });
+      assert.equal(body, 'cached-bytes');
+      assert.equal(length, 'cached-bytes'.length);
+      assert.deepEqual(
+        storage.calls.map(c => c.method),
+        ['_isTarballAllowedByFilters', 'localStorage.getTarball'],
+      );
+    },
+  );
+
+  await check(
+    'a restricted read of a tarball that is not stored fails with 404 instead of reaching an uplink',
+    async () => {
+      const storage = makeFakeStorage();
+      const run = install(factory(config, {logger: NOOP_LOGGER}), storage);
+      const err = await run('GET', RESTRICTED, () =>
+        readAll(storage.getTarball('left-pad', 'left-pad-1.3.0.tgz')).then(
+          () => null,
+          e => e,
+        ),
+      );
+      assert.equal(err?.status, 404);
+      assert.ok(
+        !storage.calls.some(c => c.method === 'getTarball (Verdaccio)'),
+      );
+    },
+  );
+
+  await check(
+    'a restricted read of a tarball the filters block fails with 404 without touching storage',
+    async () => {
+      const storage = makeFakeStorage({allowed: false});
+      const run = install(factory(config, {logger: NOOP_LOGGER}), storage);
+      const err = await run('GET', RESTRICTED, () =>
+        readAll(storage.getTarball('left-pad', 'left-pad-1.3.0.tgz')).then(
+          () => null,
+          e => e,
+        ),
+      );
+      assert.equal(err?.status, 404);
+      assert.ok(
+        !storage.calls.some(c => c.method === 'localStorage.getTarball'),
+      );
+    },
+  );
+
+  await check(
+    "an online identity's tarball read goes through Verdaccio's own getTarball",
+    async () => {
+      const storage = makeFakeStorage();
+      const run = install(factory(config, {logger: NOOP_LOGGER}), storage);
+      const body = await run('GET', ONLINE, () =>
+        readAll(storage.getTarball('left-pad', 'left-pad-1.3.0.tgz')),
+      );
+      assert.equal(body, 'from-verdaccio');
+    },
+  );
+
+  await check(
+    "a restricted search asks local storage only, keeping the rest of the request's query",
+    async () => {
+      const storage = makeFakeStorage();
+      const run = install(factory(config, {logger: NOOP_LOGGER}), storage);
+      const req = {query: {text: 'left'}, headers: {host: 'x'}};
+      await run('GET', RESTRICTED, () => storage.search(0, {req}));
+      const {options} = storage.calls[0];
+      assert.equal(options.req.query.local, '');
+      assert.equal(options.req.query.text, 'left');
+      assert.equal(options.req.headers.host, 'x');
       assert.equal(
-        res.statusCode,
-        404,
-        'a scoped package must be enforced (checked against local storage), never handed off to next() untouched',
+        req.query.local,
+        undefined,
+        'the real request is not changed',
       );
+
+      await run('GET', ONLINE, () => storage.search(0, {req}));
+      assert.equal(storage.calls[1].options.req, req);
     },
   );
 
   await check(
-    'a scoped package with a pre-encoded scope (%40) is also enforced',
-    async () => {
-      const enforcer = factory({offline: ['bob']}, {logger: NOOP_LOGGER});
-      const storage = makeFakeStorage({hasLocalTarball: false});
-      const handler = captureHandler(enforcer, storage);
-      const req = makeReq({
-        path: '/%40scope%2Fpkg/-/pkg-1.0.0.tgz',
-        remoteUser: {name: 'bob'},
-      });
-      const res = makeRes();
-      await new Promise(resolve => {
-        handler(req, res, () => {});
-        setImmediate(resolve);
-      });
-      assert.equal(res.statusCode, 404);
-    },
-  );
-
-  await check(
-    'an online user still reaches a scoped package untouched',
-    async () => {
-      const enforcer = factory({online: ['alice']}, {logger: NOOP_LOGGER});
+    "refuses to start against a storage missing a method it wraps, naming what's missing",
+    () => {
       const storage = makeFakeStorage();
-      const handler = captureHandler(enforcer, storage);
-      const req = makeReq({
-        path: '/@scope/pkg/-/pkg-1.0.0.tgz',
-        remoteUser: {name: 'alice'},
+      delete storage._syncUplinksMetadata;
+      delete storage.localStorage;
+      const errors = [];
+      const enforcer = factory(config, {
+        logger: {...NOOP_LOGGER, error: (obj, msg) => errors.push(msg)},
       });
-      const res = makeRes();
-      let nextCalled = false;
-      handler(req, res, () => {
-        nextCalled = true;
-      });
-      assert.equal(nextCalled, true);
+      assert.throws(
+        () => enforcer.register_middlewares({use() {}}, {}, storage),
+        /_syncUplinksMetadata, localStorage\.getTarball/,
+      );
+      assert.equal(errors.length, 1, 'logged at error level as well');
+    },
+  );
+
+  await check(
+    'installing twice on the same storage wraps it once',
+    async () => {
+      const storage = makeFakeStorage();
+      const enforcer = factory(config, {logger: NOOP_LOGGER});
+      install(enforcer, storage);
+      const once = storage._syncUplinksMetadata;
+      install(enforcer, storage);
+      assert.equal(storage._syncUplinksMetadata, once);
     },
   );
 
@@ -318,5 +413,5 @@ async function main() {
 
 main().catch(err => {
   console.error(err);
-  process.exitCode = 1;
+  process.exit(1);
 });

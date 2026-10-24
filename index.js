@@ -1,46 +1,45 @@
 'use strict';
 
-const {convertDistRemoteToLocalTarballUrls} = require('@verdaccio/tarball');
+const {AsyncLocalStorage} = require('node:async_hooks');
+const {PassThrough} = require('node:stream');
 
-// A package/scope segment: no slashes, no path traversal, not empty.
-const SAFE_SEGMENT = /^[^/@][^/]*$/;
+// Set for each request by register_middlewares() below and read by the
+// storage wrappers, which Verdaccio calls from deep inside its own route
+// handlers with no `req` in reach. AsyncLocalStorage carries the value
+// through the storage plugin's callbacks and promises in between, the same
+// way verdaccio-attestations carries its offline-restriction context into
+// filter_metadata().
+const requestContext = new AsyncLocalStorage();
 
-// Mirrors @verdaccio/middleware's encodeScopePackage, applied to req.path so a
-// scoped name (`@scope/pkg`) is treated as the single first path segment.
-function normalizeScopedPath(path) {
-  return path.replace(/\/%40/, '/@').replace(/(\/@[^/%]+)\/(?!$)/, '$1%2F');
+// The storage methods this plugin wraps, and which Verdaccio itself calls for
+// every read that can reach an uplink. They're Verdaccio internals (6.7.4 and
+// 6.10.7 both have them with the signatures used below), so their absence
+// stops the boot instead of leaving restricted identities online.
+const REQUIRED_STORAGE_METHODS = [
+  '_syncUplinksMetadata',
+  '_isTarballAllowedByFilters',
+  'getTarball',
+  'search',
+];
+
+const WRAPPED = Symbol('verdaccio-offline-enforcer.wrapped');
+
+function isRestrictedRequest() {
+  return requestContext.getStore()?.restricted === true;
 }
 
-function isSafeName(segment) {
-  return (
-    typeof segment === 'string' &&
-    !segment.includes('..') &&
-    SAFE_SEGMENT.test(segment)
-  );
-}
-
-// A decoded package name: either a single safe segment (unscoped, e.g.
-// "left-pad"), or exactly one "/" with a "@scope" half on the left (itself
-// a safe segment once its leading "@" is stripped) and a safe segment on
-// the right (e.g. "@scope/pkg"). Anything with zero "/" but a leading "@",
-// or more than one "/", is never a real package name and must not be
-// treated as a safe one just because it superficially looks segment-like.
-function isSafePackageName(name) {
-  if (typeof name !== 'string' || name.includes('..')) return false;
-  const parts = name.split('/');
-  if (parts.length === 1) return SAFE_SEGMENT.test(name);
-  return (
-    parts.length === 2 &&
-    parts[0].startsWith('@') &&
-    SAFE_SEGMENT.test(parts[0].slice(1)) &&
-    SAFE_SEGMENT.test(parts[1])
-  );
+// The error Verdaccio's own getTarball emits for a tarball its filters
+// block; its error middleware turns err.status into the response status.
+function noSuchPackage() {
+  return Object.assign(new Error('no such package available'), {
+    status: 404,
+    code: 404,
+  });
 }
 
 class OfflineEnforcer {
   constructor(config, options) {
     this.logger = options.logger;
-    this.urlPrefix = config.urlPrefix;
 
     // Renamed from onlineUsernames/offlineUsernames -- those old keys are no
     // longer read at all, so a config still using them would otherwise go
@@ -48,7 +47,7 @@ class OfflineEnforcer {
     // thing left deciding restriction, silently dropping every configured
     // exemption). Fail loud instead of leaving a stale config no-op.
     if ('onlineUsernames' in config || 'offlineUsernames' in config) {
-      throw new Error(
+      throw this._configError(
         "offline-enforcer: 'onlineUsernames'/'offlineUsernames' were renamed to 'online'/'offline' " +
           '(now accepting usernames or groups, not just usernames) -- update your config',
       );
@@ -74,11 +73,19 @@ class OfflineEnforcer {
     // request time -- this is an access control.
     for (const entry of this.online) {
       if (this.offline.has(entry)) {
-        throw new Error(
+        throw this._configError(
           `offline-enforcer: '${entry}' is listed in both online and offline`,
         );
       }
     }
+  }
+
+  // Verdaccio's plugin loader can catch a constructor's throw and carry on
+  // without the plugin when the plugins directory isn't on Node's module
+  // path, so the reason is logged at error level before it's thrown.
+  _configError(message) {
+    this.logger.error({}, message);
+    return new Error(message);
   }
 
   // Anonymous users have no `name`, handled first via enforceForAnonymous.
@@ -90,7 +97,8 @@ class OfflineEnforcer {
   // those too) against online/offline: online always wins (never
   // restricted) if the name or ANY group matches, then offline (always
   // restricted) the same way, then enforceForUnknown decides anyone
-  // matching neither.
+  // matching neither. verdaccio-attestations mirrors this field for field
+  // (its _isOfflineRestricted); change both together.
   _isRestricted(remoteUser) {
     if (remoteUser?.name === undefined) return this.enforceForAnonymous;
     const identities = [remoteUser.name, ...(remoteUser.real_groups ?? [])];
@@ -99,141 +107,117 @@ class OfflineEnforcer {
     return this.enforceForUnknown;
   }
 
+  // Verdaccio's own routes answer every request, so its access rules,
+  // generated-token checks (revocation, read-only, CIDR), filters, version
+  // and dist-tag handling, tarball URL rewriting and response format all
+  // apply as usual. This plugin only marks a restricted identity's reads
+  // and, through the storage wrappers, turns off every uplink lookup those
+  // reads would make. Writes (publish, unpublish, dist-tag changes) are left
+  // alone, so Verdaccio still checks an uplink before a name is published.
   register_middlewares(app, auth, storage) {
+    this._wrapStorage(storage);
+
     app.use((req, res, next) => {
-      if (req.method !== 'GET') return next();
-      if (!this._isRestricted(req.remote_user)) return next();
-
-      const segments = normalizeScopedPath(req.path).split('/').filter(Boolean);
-      // Everything else (whoami, ping, search, dist-tags, web UI) lives under /-/.
-      if (segments.length === 0 || segments[0] === '-') return next();
-
-      const rawPackageName = decodeURIComponent(segments[0]);
-      if (!isSafePackageName(rawPackageName)) return next();
-
-      if (segments[1] === '-') {
-        if (segments.length < 3 || !isSafeName(segments[2])) return next();
-        return this._handleTarball(
-          req,
-          res,
-          storage,
-          rawPackageName,
-          decodeURIComponent(segments[2]),
-        );
-      }
-
-      if (segments.length <= 2) {
-        const queryVersion =
-          segments[1] !== undefined
-            ? decodeURIComponent(segments[1])
-            : undefined;
-        return this._handleMetadata(
-          req,
-          res,
-          storage,
-          rawPackageName,
-          queryVersion,
-        );
-      }
-
-      return next();
+      const read = req.method === 'GET' || req.method === 'HEAD';
+      const restricted = read && this._isRestricted(req.remote_user);
+      requestContext.run({restricted, user: req.remote_user?.name}, () =>
+        next(),
+      );
     });
   }
 
-  _handleTarball(req, res, storage, packageName, filename) {
-    const user = req.remote_user?.name;
-    storage
-      .hasLocalTarball(packageName, filename)
-      .then(hasLocal => {
-        if (!hasLocal) {
-          this.logger.warn(
-            {pkg: packageName, filename, user},
-            'offline-enforcer: blocked tarball fetch -- not cached locally',
+  _wrapStorage(storage) {
+    const missing = REQUIRED_STORAGE_METHODS.filter(
+      name => typeof storage?.[name] !== 'function',
+    );
+    if (typeof storage?.localStorage?.getTarball !== 'function') {
+      missing.push('localStorage.getTarball');
+    }
+    if (missing.length > 0) {
+      throw this._configError(
+        `offline-enforcer: this Verdaccio's storage has no ${missing.join(', ')}; ` +
+          'refusing to start without cache-only enforcement',
+      );
+    }
+    if (storage[WRAPPED]) return;
+    storage[WRAPPED] = true;
+
+    const logger = this.logger;
+    const {_syncUplinksMetadata, getTarball, search} = storage;
+
+    // Every metadata read (GET/HEAD of a package or version, dist-tags, the
+    // web UI's readme and sidebar) and getTarball's own fallback go through
+    // here. With uplinksLook false Verdaccio answers from local storage,
+    // still running every filter, and 404s a package it has never cached.
+    storage._syncUplinksMetadata = function (name, info, options, callback) {
+      if (!isRestrictedRequest()) {
+        return _syncUplinksMetadata.call(this, name, info, options, callback);
+      }
+      return _syncUplinksMetadata.call(
+        this,
+        name,
+        info,
+        {...options, uplinksLook: false},
+        (err, ...rest) => {
+          if (err?.status === 404) {
+            logger.warn(
+              {pkg: name, user: requestContext.getStore()?.user},
+              'offline-enforcer: @{pkg} is not cached, and @{user} is cache-only',
+            );
+          }
+          callback(err, ...rest);
+        },
+      );
+    };
+
+    // Verdaccio's getTarball falls back to an uplink when the tarball isn't
+    // stored, even when the cached metadata already names it. For a
+    // restricted read this does what it does minus that fallback: the
+    // filter check first, then local storage only.
+    storage.getTarball = function (name, filename) {
+      if (!isRestrictedRequest()) return getTarball.call(this, name, filename);
+
+      const out = new PassThrough();
+      out.abort = () => {};
+      this._isTarballAllowedByFilters(name, filename).then(
+        allowed => {
+          if (!allowed) {
+            out.emit('error', noSuchPackage());
+            return;
+          }
+          const local = this.localStorage.getTarball(name, filename);
+          out.abort = () => local.abort?.();
+          local.on('content-length', length =>
+            out.emit('content-length', length),
           );
-          return res.status(404).json({
-            error: 'not_found',
-            reason: `${packageName}/${filename} is not available offline`,
+          local.on('open', () => local.pipe(out));
+          local.on('error', err => {
+            if (err?.status === 404) {
+              logger.warn(
+                {pkg: name, filename, user: requestContext.getStore()?.user},
+                'offline-enforcer: @{pkg}/@{filename} is not cached, and @{user} is cache-only',
+              );
+            }
+            out.emit('error', err);
           });
-        }
-        const stream = storage.getTarball(packageName, filename);
-        stream.on('content-length', len => res.header('Content-Length', len));
-        stream.on('error', err => {
-          if (res.headersSent) return res.end();
-          res
-            .status(err.status || 404)
-            .json({error: 'not_found', reason: err.message});
-        });
-        res.header('Content-Type', 'application/octet-stream');
-        stream.pipe(res);
-      })
-      .catch(err => {
-        this.logger.error(
-          {err, pkg: packageName},
-          'offline-enforcer: error checking local tarball',
-        );
-        res.status(500).json({error: 'internal_error'});
+        },
+        err => out.emit('error', err),
+      );
+      return out;
+    };
+
+    // Search asks every uplink unless the request's query has `local`.
+    storage.search = function (startkey, options) {
+      if (!isRestrictedRequest()) return search.call(this, startkey, options);
+      const req = options?.req;
+      const query = {...req?.query, local: ''};
+      return search.call(this, startkey, {
+        ...options,
+        req: req ? Object.assign(Object.create(req), {query}) : {query},
       });
-  }
-
-  _handleMetadata(req, res, storage, packageName, queryVersion) {
-    const user = req.remote_user?.name;
-    const accept = req.headers.accept || '';
-    const abbreviated = accept.includes('vnd.npm.install-v1+json');
-
-    storage.getPackage({
-      name: packageName,
-      // The one option that matters: skip every uplink and answer from local storage only.
-      uplinksLook: false,
-      req,
-      abbreviated,
-      callback: (err, metadata) => {
-        if (err) {
-          this.logger.warn(
-            {pkg: packageName, user, err: err.message},
-            'offline-enforcer: blocked metadata fetch -- not available offline',
-          );
-          return res.status(err.status || 404).json({
-            error: 'not_found',
-            reason: `${packageName} is not available offline`,
-          });
-        }
-
-        metadata = convertDistRemoteToLocalTarballUrls(
-          metadata,
-          {
-            protocol: req.protocol,
-            headers: req.headers,
-            host: req.hostname,
-            remoteAddress: req.socket.remoteAddress,
-          },
-          this.urlPrefix,
-        );
-
-        if (queryVersion === undefined) {
-          res.setHeader(
-            'Content-Type',
-            abbreviated
-              ? 'application/vnd.npm.install-v1+json'
-              : 'application/json',
-          );
-          return res.json(metadata);
-        }
-
-        let version = metadata.versions?.[queryVersion];
-        if (!version && metadata['dist-tags']?.[queryVersion]) {
-          version = metadata.versions?.[metadata['dist-tags'][queryVersion]];
-        }
-        if (!version) {
-          return res.status(404).json({
-            error: 'not_found',
-            reason: `${packageName}@${queryVersion} is not available offline`,
-          });
-        }
-        res.setHeader('Content-Type', 'application/json');
-        res.json(version);
-      },
-    });
+    };
   }
 }
 
 module.exports = (config, options) => new OfflineEnforcer(config, options);
+module.exports.OfflineEnforcer = OfflineEnforcer;

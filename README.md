@@ -57,47 +57,64 @@ middlewares:
 Construction throws if the same entry appears in both `online` and `offline` --
 a config mistake, not something to silently resolve one way or the other.
 
-## Behavior details
+## How it works
 
-- Only intercepts `GET` requests -- publish/unpublish and other methods pass
-  through untouched.
-- Ignores everything under `/-/` (`whoami`, `ping`, search, dist-tags, the web
-  UI) -- those aren't package fetches.
-- Parses the request path the same way Verdaccio's own routing does, including
-  scoped-package `%40` encoding (`@scope%2Fname` <-> `@scope/name`), and
-  validates each path segment against a safe-name pattern (no `/`, no `..`)
-  before using it -- this guards against path-traversal via a crafted
-  package/filename segment.
-- **Tarball requests** (`GET /<pkg>/-/<file>.tgz`): checks
-  `storage.hasLocalTarball()` and either streams the cached tarball directly or
-  returns `404 not_found` if it isn't cached -- never falls through to the
-  uplink.
-- **Metadata requests** (`GET /<pkg>` or `GET /<pkg>/<version-or-tag>`): calls
-  `storage.getPackage({ uplinksLook: false, ... })`, which forces a local-only
-  lookup, then rewrites any `dist.tarball` URLs in the response to point at this
-  registry (via `@verdaccio/tarball`'s `convertDistRemoteToLocalTarballUrls`)
-  instead of the original upstream URLs, so a subsequent tarball fetch also
-  stays local.
+The plugin never answers a request itself. Verdaccio's own routes answer every
+one, so its `packages:` access rules (401 for anonymous, 403 for a user without
+access), its checks on tokens from `npm token create` (revocation, read-only,
+CIDR), every `filter_metadata` plugin, version and dist-tag handling, tarball
+URL rewriting and its response format all apply exactly as they do without this
+plugin.
+
+For a `GET` or `HEAD` from a restricted identity, the plugin turns off the
+uplink lookups Verdaccio's storage would make:
+
+- package metadata, for every route that reads it (`/<pkg>`, `/<pkg>/<version>`,
+  `/-/package/<pkg>/dist-tags`, the web UI's readme and sidebar), comes from
+  local storage only, and a package never cached is a 404;
+- a tarball comes from local storage only, after Verdaccio's own filter check,
+  even when the cached metadata names one storage doesn't hold yet;
+- search (`/-/v1/search`, `/-/all`) asks local storage only.
+
+Writes (publish, unpublish, dist-tag changes) are left alone, so Verdaccio still
+asks the uplink whether a name already exists before accepting a publish.
+
+It does this by wrapping three methods on the storage object
+`register_middlewares()` receives (`_syncUplinksMetadata`, `getTarball`,
+`search`) and marking each request with an `AsyncLocalStorage` context, the same
+technique `verdaccio-attestations` uses. Those are Verdaccio internals, present
+with the same signatures in 6.7.4 and 6.10.7; if the storage lacks any of them
+the plugin logs an error and refuses to start rather than leave restricted
+identities online.
+
+Needs Node.js 22.12 or later.
 
 ## Logging
 
-`warn` on every blocked fetch (`offline-enforcer: blocked tarball fetch...` /
-`...blocked metadata fetch...`), including the package/user; `error` only on
-unexpected storage failures.
+`warn` when a restricted identity asks for a package or tarball that isn't
+cached (`offline-enforcer: <pkg> is not cached, and <user> is cache-only`).
+`error` for a configuration the plugin refuses to start with.
 
 ## Testing
 
 ```bash
-node test/smoke.js
+yarn test
 ```
 
-No test framework/build step -- a hand-rolled `node:assert`-based smoke test
-that captures `register_middlewares()`'s single handler and drives it against
-hand-built req/res objects and a minimal fake `Storage`.
+Runs `test/smoke.js` (the restriction rules, and the storage wrappers against a
+fake storage) and `test/verdaccio.js`, which runs the plugin in a real Verdaccio
+in front of a fake uplink that counts every request it gets. Point
+`VERDACCIO_BIN` at another Verdaccio build to run the second against it, for
+example the one fm-npmjs deploys:
+
+```bash
+VERDACCIO_BIN=../fm-npmjs/node_modules/verdaccio/bin/verdaccio node test/verdaccio.js
+```
 
 ## Dependencies
 
-`@verdaccio/tarball` -- used purely for the dist-URL rewriting helper.
+None at runtime: everything it uses is Node's own (`node:async_hooks`,
+`node:stream`) or Verdaccio's storage object.
 
 ## License
 
